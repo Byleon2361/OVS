@@ -1,0 +1,6 @@
+#!/bin/bash
+#SBATCH --nodes=2 --ntasks-per-node=1
+#SBATCH --job-name=myTask
+cd $SLURM_SUBMIT_DIR
+
+mpiexec -n 2 numactl --cpunodebind=0 --membind=0 ./main ./output.txt

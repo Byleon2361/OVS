@@ -1,0 +1,8 @@
+#!/bin/sh
+#SBATCH --nodes=1 --ntasks-per-node=2
+#SBATCH --job-name=qpi
+
+cd $SLURM_SUBMIT_DIR
+
+mpiexec -n 1 numactl --cpunodebind=0 --membind=0 ./main ./output_qpi.txt : \
+        -n 1 numactl --cpunodebind=1 --membind=1 ./main ./output_qpi.txt
