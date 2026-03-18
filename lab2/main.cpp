@@ -5,520 +5,435 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
-using namespace std;
-using namespace chrono;
-
 struct Task {
   int r;
   int t;
-  int original_index;
 };
 
-struct TournamentNode {
-  int value;
-  int level_index;
+struct ScheduleEntry {
+  long long tau;
+  std::vector<int> machines;
 };
+
+struct Result {
+  std::vector<ScheduleEntry> schedule;
+  long long T_S;
+  double eps;
+  double elapsed_sec;
+};
+
+std::vector<int> counting_sort_desc(const std::vector<Task> &tasks) {
+  if (tasks.empty())
+    return {};
+
+  int t_max = 0;
+  for (auto &task : tasks)
+    t_max = std::max(t_max, task.t);
+
+  std::vector<std::vector<int>> buckets(t_max + 1);
+  for (int i = 0; i < (int)tasks.size(); ++i)
+    buckets[tasks[i].t].push_back(i);
+
+  std::vector<int> order;
+  order.reserve(tasks.size());
+  for (int v = t_max; v >= 0; --v)
+    for (int idx : buckets[v])
+      order.push_back(idx);
+
+  return order;
+}
 
 class TournamentTree {
-private:
-  vector<TournamentNode> tree;
-  int size;
-  int capacity;
-
 public:
-  TournamentTree(int max_levels) {
-
-    size = 1;
-    while (size < max_levels) {
-      size <<= 1;
-    }
-    capacity = 2 * size;
-    tree.resize(capacity);
-
-    for (int i = 0; i < size; i++) {
-      if (i < max_levels) {
-        tree[size + i].value = 0;
-        tree[size + i].level_index = i;
-      } else {
-        tree[size + i].value = -1;
-        tree[size + i].level_index = i;
-      }
-    }
-
-    for (int i = size - 1; i > 0; i--) {
-      tree[i].value = max(tree[2 * i].value, tree[2 * i + 1].value);
-      tree[i].level_index = -1;
-    }
+  explicit TournamentTree(int capacity) {
+    n_leaves = 1;
+    while (n_leaves < capacity)
+      n_leaves <<= 1;
+    tree.assign(2 * n_leaves, 0);
   }
 
-  int find_first_fit(int required_em) {
-    if (tree[1].value < required_em) {
+  void update(int idx, int value) {
+    int pos = n_leaves + idx;
+    tree[pos] = value;
+    for (pos >>= 1; pos >= 1; pos >>= 1)
+      tree[pos] = std::max(tree[2 * pos], tree[2 * pos + 1]);
+  }
+
+  int find_first_fit(int required, int num_active) const {
+    if (tree[1] < required)
       return -1;
+    int pos = 1;
+    while (pos < n_leaves) {
+      int left = 2 * pos;
+      int right = 2 * pos + 1;
+      pos = (tree[left] >= required) ? left : right;
     }
-
-    int node = 1;
-    while (node < size) {
-      if (tree[2 * node].value >= required_em) {
-        node = 2 * node;
-      } else {
-        node = 2 * node + 1;
-      }
-    }
-
-    return tree[node].level_index;
+    int leaf_idx = pos - n_leaves;
+    return (leaf_idx < num_active) ? leaf_idx : -1;
   }
 
-  void update_level(int level_index, int new_free_em) {
-    int node = size + level_index;
-    tree[node].value = new_free_em;
-
-    node /= 2;
-    while (node >= 1) {
-      tree[node].value = max(tree[2 * node].value, tree[2 * node + 1].value);
-      node /= 2;
-    }
-  }
-
-  int get_level_value(int level_index) { return tree[size + level_index].value; }
+private:
+  int n_leaves;
+  std::vector<int> tree;
 };
 
-struct Schedule {
-  vector<vector<Task>> levels;
-  double T;
-};
+Result nfdh(const std::vector<Task> &tasks, int n) {
+  int m = (int)tasks.size();
+  Result res;
+  res.schedule.resize(m);
 
-void counting_sort_by_time(vector<Task> &tasks, int max_time) {
-  if (tasks.empty())
-    return;
-
-  vector<vector<Task>> buckets(max_time + 1);
-
-  for (const auto &task : tasks) {
-    buckets[task.t].push_back(task);
+  if (m == 0) {
+    res.T_S = 0;
+    res.eps = 0;
+    return res;
   }
 
-  tasks.clear();
-  for (int t = max_time; t >= 1; t--) {
-    for (const auto &task : buckets[t]) {
-      tasks.push_back(task);
-    }
-  }
-}
+  auto order = counting_sort_desc(tasks);
 
-void counting_sort_by_time_with_indices(vector<Task> &tasks, int max_time) {
-  if (tasks.empty())
-    return;
+  struct Shelf {
+    long long start;
+    int height;
+    int next_col;
+  };
+  std::vector<Shelf> shelves;
+  long long cumtime = 0;
 
-  vector<vector<Task>> buckets(max_time + 1);
+  for (int orig_idx : order) {
+    int r = tasks[orig_idx].r;
+    int t = tasks[orig_idx].t;
 
-  for (const auto &task : tasks) {
-    buckets[task.t].push_back(task);
-  }
-
-  tasks.clear();
-  for (int t = max_time; t >= 1; t--) {
-    for (const auto &task : buckets[t]) {
-      tasks.push_back(task);
-    }
-  }
-}
-
-double compute_lower_bound(const vector<Task> &tasks) {
-  double sum = 0.0;
-  for (const auto &task : tasks) {
-    sum += task.r * task.t;
-  }
-  return sum;
-}
-
-double compute_epsilon(double T, double T_prime) { return (T - T_prime) / T_prime; }
-
-Schedule NFDH(vector<Task> tasks, int n_em) {
-  auto start_time = high_resolution_clock::now();
-
-  Schedule schedule;
-  double T_prime = compute_lower_bound(tasks);
-
-  counting_sort_by_time(tasks, 100);
-
-  vector<vector<Task>> levels;
-  vector<int> free_em;
-
-  for (const auto &task : tasks) {
     bool placed = false;
-
-    if (!levels.empty()) {
-      int last_level = levels.size() - 1;
-      if (free_em[last_level] >= task.r) {
-        levels[last_level].push_back(task);
-        free_em[last_level] -= task.r;
+    if (!shelves.empty()) {
+      auto &shelf = shelves.back();
+      int free = n - shelf.next_col + 1;
+      if (free >= r) {
+        std::vector<int> mach(r);
+        std::iota(mach.begin(), mach.end(), shelf.next_col);
+        res.schedule[orig_idx] = {shelf.start, std::move(mach)};
+        shelf.next_col += r;
         placed = true;
       }
     }
-
     if (!placed) {
-      levels.push_back({task});
-      free_em.push_back(n_em - task.r);
+      long long start = cumtime;
+      cumtime += t;
+      shelves.push_back({start, t, r + 1});
+      std::vector<int> mach(r);
+      std::iota(mach.begin(), mach.end(), 1);
+      res.schedule[orig_idx] = {start, std::move(mach)};
     }
   }
 
-  double T_value = 0.0;
-  for (size_t i = 0; i < levels.size(); i++) {
-
-    int max_t = 0;
-    for (const auto &task : levels[i]) {
-      max_t = max(max_t, task.t);
-    }
-    T_value += max_t;
-  }
-
-  auto end_time = high_resolution_clock::now();
-  double elapsed_time = duration<double>(end_time - start_time).count();
-
-  schedule.levels = levels;
-  schedule.T = T_value;
-
-  cout << "Алгоритм: NFDH" << endl;
-  cout << "T(S) = " << T_value << endl;
-  cout << "T' = " << T_prime << endl;
-  cout << "ε = " << compute_epsilon(T_value, T_prime) * 100 << "%" << endl;
-  cout << "Время выполнения: " << elapsed_time << " сек" << endl;
-  cout << "Количество уровней: " << levels.size() << endl;
-  cout << "------------------------" << endl;
-
-  return schedule;
+  res.T_S = cumtime;
+  double T_prime = 0;
+  for (auto &tk : tasks)
+    T_prime += (double)tk.r * tk.t;
+  T_prime /= n;
+  res.eps = (T_prime > 0) ? (res.T_S - T_prime) / T_prime : 0.0;
+  return res;
 }
 
-Schedule FFDH(vector<Task> tasks, int n_em) {
-  auto start_time = high_resolution_clock::now();
+Result ffdh(const std::vector<Task> &tasks, int n) {
+  int m = (int)tasks.size();
+  Result res;
+  res.schedule.resize(m);
 
-  Schedule schedule;
-  double T_prime = compute_lower_bound(tasks);
+  if (m == 0) {
+    res.T_S = 0;
+    res.eps = 0;
+    return res;
+  }
 
-  counting_sort_by_time(tasks, 100);
+  auto order = counting_sort_desc(tasks);
 
-  vector<vector<Task>> levels;
-  vector<int> free_em;
-  vector<int> level_max_t;
+  struct Shelf {
+    long long start;
+    int height;
+    int next_col;
+  };
+  std::vector<Shelf> shelf_data;
+  long long cumtime = 0;
+  int num_shelves = 0;
+  TournamentTree tree(m);
 
-  TournamentTree tree(tasks.size());
+  for (int orig_idx : order) {
+    int r = tasks[orig_idx].r;
+    int t = tasks[orig_idx].t;
 
-  for (const auto &task : tasks) {
+    int idx = tree.find_first_fit(r, num_shelves);
 
-    int level_index = tree.find_first_fit(task.r);
+    if (idx == -1) {
 
-    if (level_index != -1 && level_index < static_cast<int>(levels.size())) {
-
-      levels[level_index].push_back(task);
-      free_em[level_index] -= task.r;
-
-      level_max_t[level_index] = max(level_max_t[level_index], task.t);
-
-      tree.update_level(level_index, free_em[level_index]);
+      long long start = cumtime;
+      cumtime += t;
+      shelf_data.push_back({start, t, r + 1});
+      std::vector<int> mach(r);
+      std::iota(mach.begin(), mach.end(), 1);
+      res.schedule[orig_idx] = {start, std::move(mach)};
+      tree.update(num_shelves, n - r);
+      ++num_shelves;
     } else {
-
-      levels.push_back({task});
-      free_em.push_back(n_em - task.r);
-      level_max_t.push_back(task.t);
-
-      tree.update_level(levels.size() - 1, n_em - task.r);
+      auto &shelf = shelf_data[idx];
+      std::vector<int> mach(r);
+      std::iota(mach.begin(), mach.end(), shelf.next_col);
+      res.schedule[orig_idx] = {shelf.start, std::move(mach)};
+      shelf.next_col += r;
+      tree.update(idx, n - shelf.next_col + 1);
     }
   }
 
-  double T_value = 0.0;
-  for (size_t i = 0; i < levels.size(); i++) {
-    T_value += level_max_t[i];
-  }
-
-  auto end_time = high_resolution_clock::now();
-  double elapsed_time = duration<double>(end_time - start_time).count();
-
-  schedule.levels = levels;
-  schedule.T = T_value;
-
-  cout << "Алгоритм: FFDH" << endl;
-  cout << "T(S) = " << T_value << endl;
-  cout << "T' = " << T_prime << endl;
-  cout << "ε = " << compute_epsilon(T_value, T_prime) * 100 << "%" << endl;
-  cout << "Время выполнения: " << elapsed_time << " сек" << endl;
-  cout << "Количество уровней: " << levels.size() << endl;
-  cout << "------------------------" << endl;
-
-  return schedule;
+  res.T_S = cumtime;
+  double T_prime = 0;
+  for (auto &tk : tasks)
+    T_prime += (double)tk.r * tk.t;
+  T_prime /= n;
+  res.eps = (T_prime > 0) ? (res.T_S - T_prime) / T_prime : 0.0;
+  return res;
 }
 
-vector<Task> generate_random_tasks(int m, int n_em, int max_t, mt19937 &gen) {
-  uniform_int_distribution<> r_dist(1, n_em);
-  uniform_int_distribution<> t_dist(1, max_t);
+std::vector<Task> read_tasks(const std::string &filename) {
+  std::ifstream f(filename);
+  if (!f)
+    throw std::runtime_error("Не удалось открыть файл: " + filename);
 
-  vector<Task> tasks(m);
-  for (int i = 0; i < m; i++) {
-    tasks[i].r = r_dist(gen);
-    tasks[i].t = t_dist(gen);
-    tasks[i].original_index = i;
+  std::vector<Task> tasks;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#')
+      continue;
+    std::istringstream ss(line);
+    Task tk;
+    if (ss >> tk.r >> tk.t)
+      tasks.push_back(tk);
   }
-
   return tasks;
 }
 
-vector<Task> read_tasks_from_file(const string &filename) {
-  vector<Task> tasks;
-  ifstream file(filename);
+void write_tasks(const std::string &filename, const std::vector<Task> &tasks, int n) {
+  std::ofstream f(filename);
+  f << "# m=" << tasks.size() << " n=" << n << "\n";
+  for (auto &tk : tasks)
+    f << tk.r << " " << tk.t << "\n";
+}
 
-  if (!file.is_open()) {
-    cerr << "Ошибка: не удалось открыть файл " << filename << endl;
-    return tasks;
+std::vector<Task> generate_tasks(int m, int n, unsigned seed) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> dr(1, n), dt(1, 100);
+  std::vector<Task> tasks(m);
+  for (auto &tk : tasks) {
+    tk.r = dr(rng);
+    tk.t = dt(rng);
   }
-
-  int r, t;
-  int index = 0;
-  while (file >> r >> t) {
-    tasks.push_back({r, t, index++});
-  }
-
-  file.close();
   return tasks;
 }
 
-void save_schedule_to_file(const Schedule &schedule, const string &filename) {
-  ofstream file(filename);
-
-  if (!file.is_open()) {
-    cerr << "Ошибка: не удалось создать файл " << filename << endl;
-    return;
-  }
-
-  file << "Расписание (уровни задач):" << endl;
-  file << "Количество уровней: " << schedule.levels.size() << endl;
-  file << "T(S) = " << schedule.T << endl;
-  file << "------------------------" << endl;
-
-  for (size_t i = 0; i < schedule.levels.size(); i++) {
-    file << "Уровень " << i + 1 << ": ";
-    for (const auto &task : schedule.levels[i]) {
-      file << "(" << task.r << "," << task.t << ") ";
-    }
-    file << endl;
-  }
-
-  file.close();
+Result run_algorithm(const std::string &algo, const std::vector<Task> &tasks, int n) {
+  auto t0 = std::chrono::high_resolution_clock::now();
+  Result res = (algo == "NFDH") ? nfdh(tasks, n) : ffdh(tasks, n);
+  auto t1 = std::chrono::high_resolution_clock::now();
+  res.elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
+  return res;
 }
 
-void study_time_dependence(int n_em) {
-  cout << "\n==========================================" << endl;
-  cout << "Исследование времени выполнения (n = " << n_em << ")" << endl;
-  cout << "==========================================" << endl;
+void print_schedule(const Result &res, const std::vector<Task> &tasks, const std::string &algo, bool verbose = true) {
+  std::cout << "\n" << std::string(52, '=') << "\n";
+  std::cout << "Алгоритм  : " << algo << "\n";
+  std::cout << "T(S)      : " << res.T_S << "\n";
+  std::cout << "ε         : " << std::fixed << std::setprecision(6) << res.eps << "\n";
+  std::cout << "Время     : " << std::fixed << std::setprecision(6) << res.elapsed_sec << " с\n";
 
-  random_device rd;
-  mt19937 gen(rd());
-
-  vector<int> m_values = {500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000};
-
-  cout << setw(10) << "m" << setw(15) << "NFDH время" << setw(15) << "FFDH время" << endl;
-  cout << "------------------------------------------------" << endl;
-
-  for (int m : m_values) {
-    vector<Task> tasks = generate_random_tasks(m, n_em, 100, gen);
-
-    auto start = high_resolution_clock::now();
-    NFDH(tasks, n_em);
-    auto end = high_resolution_clock::now();
-    double nfdh_time = duration<double>(end - start).count();
-
-    start = high_resolution_clock::now();
-    FFDH(tasks, n_em);
-    end = high_resolution_clock::now();
-    double ffdh_time = duration<double>(end - start).count();
-
-    cout << setw(10) << m << setw(15) << nfdh_time << setw(15) << ffdh_time << endl;
-  }
-}
-
-void study_accuracy_random(int n_em, int num_experiments = 10) {
-  cout << "\n==========================================" << endl;
-  cout << "Сравнительный анализ точности (n = " << n_em << ", случайные данные)" << endl;
-  cout << "==========================================" << endl;
-
-  random_device rd;
-  mt19937 gen(rd());
-
-  vector<int> m_values = {500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000};
-
-  cout << setw(10) << "m" << setw(15) << "NFDH ε ср" << setw(15) << "NFDH σ" << setw(15) << "FFDH ε ср" << setw(15)
-       << "FFDH σ" << setw(15) << "Лучший" << endl;
-  cout << "----------------------------------------------------------------------------------------" << endl;
-
-  for (int m : m_values) {
-    vector<double> nfdh_epsilons;
-    vector<double> ffdh_epsilons;
-
-    for (int exp = 0; exp < num_experiments; exp++) {
-      vector<Task> tasks = generate_random_tasks(m, n_em, 100, gen);
-
-      Schedule nfdh_sched = NFDH(tasks, n_em);
-      Schedule ffdh_sched = FFDH(tasks, n_em);
-
-      double T_prime = compute_lower_bound(tasks);
-
-      double nfdh_eps = compute_epsilon(nfdh_sched.T, T_prime);
-      double ffdh_eps = compute_epsilon(ffdh_sched.T, T_prime);
-
-      nfdh_epsilons.push_back(nfdh_eps);
-      ffdh_epsilons.push_back(ffdh_eps);
-    }
-
-    double nfdh_sum = 0.0;
-    for (double eps : nfdh_epsilons)
-      nfdh_sum += eps;
-    double nfdh_mean = nfdh_sum / num_experiments;
-
-    double nfdh_var = 0.0;
-    for (double eps : nfdh_epsilons)
-      nfdh_var += (eps - nfdh_mean) * (eps - nfdh_mean);
-    double nfdh_std = sqrt(nfdh_var / num_experiments);
-
-    double ffdh_sum = 0.0;
-    for (double eps : ffdh_epsilons)
-      ffdh_sum += eps;
-    double ffdh_mean = ffdh_sum / num_experiments;
-
-    double ffdh_var = 0.0;
-    for (double eps : ffdh_epsilons)
-      ffdh_var += (eps - ffdh_mean) * (eps - ffdh_mean);
-    double ffdh_std = sqrt(ffdh_var / num_experiments);
-
-    string best = (nfdh_mean < ffdh_mean) ? "NFDH" : "FFDH";
-
-    cout << setw(10) << m << setw(15) << nfdh_mean * 100 << "%" << setw(15) << nfdh_std * 100 << "%" << setw(15)
-         << ffdh_mean * 100 << "%" << setw(15) << ffdh_std * 100 << "%" << setw(15) << best << endl;
-  }
-}
-
-void study_accuracy_real(const string &system_name, const vector<int> &m_values) {
-  cout << "\n==========================================" << endl;
-  cout << "Сравнительный анализ точности (система: " << system_name << ")" << endl;
-  cout << "==========================================" << endl;
-
-  random_device rd;
-  mt19937 gen(rd());
-
-  cout << setw(10) << "m" << setw(15) << "NFDH ε ср" << setw(15) << "NFDH σ" << setw(15) << "FFDH ε ср" << setw(15)
-       << "FFDH σ" << setw(15) << "Лучший" << endl;
-  cout << "----------------------------------------------------------------------------------------" << endl;
-
-  for (int m : m_values) {
-    vector<double> nfdh_epsilons;
-    vector<double> ffdh_epsilons;
-
-    uniform_int_distribution<> r_dist_big(512, 1024);
-    uniform_int_distribution<> t_dist_big(50, 100);
-
-    for (int exp = 0; exp < 10; exp++) {
-      vector<Task> tasks(m);
-      for (int i = 0; i < m; i++) {
-
-        if (gen() % 100 < 30) {
-          tasks[i].r = r_dist_big(gen);
-          tasks[i].t = t_dist_big(gen);
-        } else {
-          tasks[i].r = uniform_int_distribution<>(1, 256)(gen);
-          tasks[i].t = uniform_int_distribution<>(1, 50)(gen);
-        }
-        tasks[i].original_index = i;
+  if (verbose) {
+    std::cout << "\nРасписание (j, τ_j, r, t, ЭМ):\n";
+    for (int j = 0; j < (int)res.schedule.size(); ++j) {
+      auto &e = res.schedule[j];
+      std::cout << "  j=" << std::setw(4) << j + 1 << "  τ=" << std::setw(6) << e.tau << "  r=" << std::setw(4)
+                << tasks[j].r << "  t=" << std::setw(4) << tasks[j].t << "  ЭМ=[";
+      int lim = std::min((int)e.machines.size(), 5);
+      for (int k = 0; k < lim; ++k) {
+        if (k)
+          std::cout << ", ";
+        std::cout << e.machines[k];
       }
-
-      Schedule nfdh_sched = NFDH(tasks, 1024);
-      Schedule ffdh_sched = FFDH(tasks, 1024);
-
-      double T_prime = compute_lower_bound(tasks);
-
-      double nfdh_eps = compute_epsilon(nfdh_sched.T, T_prime);
-      double ffdh_eps = compute_epsilon(ffdh_sched.T, T_prime);
-
-      nfdh_epsilons.push_back(nfdh_eps);
-      ffdh_epsilons.push_back(ffdh_eps);
+      if ((int)e.machines.size() > 5)
+        std::cout << ", ...";
+      std::cout << "]\n";
     }
-
-    double nfdh_mean = 0.0, ffdh_mean = 0.0;
-    for (double eps : nfdh_epsilons)
-      nfdh_mean += eps;
-    for (double eps : ffdh_epsilons)
-      ffdh_mean += eps;
-    nfdh_mean /= 10;
-    ffdh_mean /= 10;
-
-    double nfdh_var = 0.0, ffdh_var = 0.0;
-    for (double eps : nfdh_epsilons)
-      nfdh_var += (eps - nfdh_mean) * (eps - nfdh_mean);
-    for (double eps : ffdh_epsilons)
-      ffdh_var += (eps - ffdh_mean) * (eps - ffdh_mean);
-    double nfdh_std = sqrt(nfdh_var / 10);
-    double ffdh_std = sqrt(ffdh_var / 10);
-
-    string best = (nfdh_mean < ffdh_mean) ? "NFDH" : "FFDH";
-
-    cout << setw(10) << m << setw(15) << nfdh_mean * 100 << "%" << setw(15) << nfdh_std * 100 << "%" << setw(15)
-         << ffdh_mean * 100 << "%" << setw(15) << ffdh_std * 100 << "%" << setw(15) << best << endl;
   }
+
+  double T_prime = 0;
+  for (auto &tk : tasks)
+    T_prime += (double)tk.r * tk.t;
+  T_prime /= /* n from eps */ 1;
+  std::cout << std::string(52, '=') << "\n";
+}
+
+void experiment_time() {
+  const std::vector<int> M_VALUES = {500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000};
+  const std::vector<int> N_VALUES = {1024, 4096};
+
+  std::cout << "\n" << std::string(70, '=') << "\n";
+  std::cout << "ЭКСПЕРИМЕНТ 2 — Зависимость времени от m и n\n";
+  std::cout << std::string(70, '=') << "\n";
+  std::cout << std::setw(6) << "m" << std::setw(6) << "n" << std::setw(14) << "NFDH (с)" << std::setw(14) << "FFDH (с)"
+            << "\n";
+  std::cout << std::string(42, '-') << "\n";
+
+  for (int n : N_VALUES) {
+    for (int i = 0; i < (int)M_VALUES.size(); ++i) {
+      int m = M_VALUES[i];
+      auto tasks = generate_tasks(m, n, (unsigned)i);
+
+      auto r_n = run_algorithm("NFDH", tasks, n);
+      auto r_f = run_algorithm("FFDH", tasks, n);
+
+      std::cout << std::setw(6) << m << std::setw(6) << n << std::fixed << std::setprecision(6) << std::setw(14)
+                << r_n.elapsed_sec << std::setw(14) << r_f.elapsed_sec << "\n";
+    }
+  }
+
+  std::cout << "\nВывод: NFDH — O(m + T_max), FFDH — O(m log m).\n"
+               "При росте m оба алгоритма замедляются линейно (FFDH — с log-множителем).\n"
+               "При росте n время увеличивается: больше ЭМ → обычно больше полок.\n";
+}
+
+void experiment_quality_random() {
+  const std::vector<int> M_VALUES = {500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000};
+  const int N = 1024;
+
+  std::cout << "\n" << std::string(70, '=') << "\n";
+  std::cout << "ЭКСПЕРИМЕНТ 3 — Качество расписаний (случайные задачи, n=1024)\n";
+  std::cout << std::string(70, '=') << "\n";
+  std::cout << std::setw(6) << "m" << std::setw(12) << "ε NFDH" << std::setw(12) << "ε FFDH" << "\n";
+  std::cout << std::string(32, '-') << "\n";
+
+  std::vector<double> eps_n_list, eps_f_list;
+  for (int i = 0; i < (int)M_VALUES.size(); ++i) {
+    int m = M_VALUES[i];
+    auto tasks = generate_tasks(m, N, (unsigned)i);
+
+    auto r_n = run_algorithm("NFDH", tasks, N);
+    auto r_f = run_algorithm("FFDH", tasks, N);
+
+    eps_n_list.push_back(r_n.eps);
+    eps_f_list.push_back(r_f.eps);
+
+    std::cout << std::setw(6) << m << std::fixed << std::setprecision(6) << std::setw(12) << r_n.eps << std::setw(12)
+              << r_f.eps << "\n";
+  }
+
+  auto mean_std = [](const std::vector<double> &v) -> std::pair<double, double> {
+    double mean = 0;
+    for (double x : v)
+      mean += x;
+    mean /= v.size();
+    double var = 0;
+    for (double x : v)
+      var += (x - mean) * (x - mean);
+    var /= (v.size() - 1);
+    return {mean, std::sqrt(var)};
+  };
+
+  auto [mn, sn] = mean_std(eps_n_list);
+  auto [mf, sf] = mean_std(eps_f_list);
+
+  std::cout << std::string(32, '-') << "\n";
+  std::cout << std::setw(6) << "E[ε]" << std::fixed << std::setprecision(6) << std::setw(12) << mn << std::setw(12)
+            << mf << "\n";
+  std::cout << std::setw(6) << "σ[ε]" << std::setw(12) << sn << std::setw(12) << sf << "\n";
+
+  std::string better = (mf < mn) ? "FFDH" : "NFDH";
+  std::cout << "\nБолее точные расписания формирует: " << better << "\n";
 }
 
 int main(int argc, char *argv[]) {
-  cout << "==========================================" << endl;
-  cout << "Программа для решения задачи упаковки задач (NFDH и FFDH)" << endl;
-  cout << "==========================================" << endl;
-
-  if (argc == 4) {
-
-    string filename = argv[1];
-    int n_em = atoi(argv[2]);
-    string algorithm = argv[3];
-
-    cout << "Чтение задач из файла: " << filename << endl;
-    cout << "Количество ЭМ: " << n_em << endl;
-    cout << "Алгоритм: " << algorithm << endl;
-    cout << "------------------------" << endl;
-
-    vector<Task> tasks = read_tasks_from_file(filename);
-
-    if (tasks.empty()) {
-      cerr << "Нет задач для обработки" << endl;
-      return 1;
-    }
-
-    Schedule result;
-    if (algorithm == "NFDH" || algorithm == "nfdh") {
-      result = NFDH(tasks, n_em);
-    } else if (algorithm == "FFDH" || algorithm == "ffdh") {
-      result = FFDH(tasks, n_em);
-    } else {
-      cerr << "Неизвестный алгоритм. Используйте NFDH или FFDH" << endl;
-      return 1;
-    }
-
-    string output_filename = "schedule_" + algorithm + "_" + filename;
-    save_schedule_to_file(result, output_filename);
-    cout << "Расписание сохранено в файл: " << output_filename << endl;
-
-  } else {
-
-    cout << "\nИсследовательский режим" << endl;
-    cout << "------------------------" << endl;
-
-    study_time_dependence(1024);
-    study_time_dependence(4096);
-
-    study_accuracy_random(1024, 10);
-
-    vector<int> real_m_values = {500, 1000, 1500};
-    study_accuracy_real("LLNL Thunder", real_m_values);
+  if (argc < 2) {
+    std::cout << "Использование:\n"
+              << "  " << argv[0] << " <файл_задач> <n> <NFDH|FFDH>\n"
+              << "  " << argv[0] << " --gen <m> <n> <seed>\n"
+              << "  " << argv[0] << " --exp-time\n"
+              << "  " << argv[0] << " --exp-quality\n";
+    return 0;
   }
 
-  cout << "\nПрограмма завершена." << endl;
+  std::string cmd = argv[1];
+
+  if (cmd == "--gen") {
+    if (argc < 5) {
+      std::cerr << "Нужно: --gen <m> <n> <seed>\n";
+      return 1;
+    }
+    int m = std::stoi(argv[2]);
+    int n = std::stoi(argv[3]);
+    unsigned seed = (unsigned)std::stoul(argv[4]);
+    auto tasks = generate_tasks(m, n, seed);
+    std::string fname = "tasks_m" + std::to_string(m) + "_n" + std::to_string(n) + "_s" + std::to_string(seed) + ".txt";
+    write_tasks(fname, tasks, n);
+    std::cout << "Набор задач сохранён в " << fname << " (m=" << m << ", n=" << n << ")\n";
+    return 0;
+  }
+
+  if (cmd == "--exp-time") {
+    experiment_time();
+    return 0;
+  }
+  if (cmd == "--exp-quality") {
+    experiment_quality_random();
+    return 0;
+  }
+
+  if (argc < 4) {
+    std::cerr << "Нужно: " << argv[0] << " <файл_задач> <n> <NFDH|FFDH>\n";
+    return 1;
+  }
+  std::string filename = argv[1];
+  int n = std::stoi(argv[2]);
+  std::string algo = argv[3];
+
+  for (char &c : algo)
+    c = (char)toupper((unsigned char)c);
+
+  if (algo != "NFDH" && algo != "FFDH") {
+    std::cerr << "Неизвестный алгоритм: " << algo << ". Допустимые: NFDH, FFDH\n";
+    return 1;
+  }
+
+  std::vector<Task> tasks;
+  try {
+    tasks = read_tasks(filename);
+  } catch (const std::exception &e) {
+    std::cerr << e.what() << "\n";
+    return 1;
+  }
+  if (tasks.empty()) {
+    std::cerr << "Набор задач пуст.\n";
+    return 1;
+  }
+
+  for (int j = 0; j < (int)tasks.size(); ++j) {
+    if (tasks[j].r > n) {
+      std::cerr << "ОШИБКА: задача " << j + 1 << " требует r=" << tasks[j].r << " ЭМ, но n=" << n << "\n";
+      return 1;
+    }
+  }
+
+  auto res = run_algorithm(algo, tasks, n);
+
+  bool verbose = (int)tasks.size() <= 50;
+  print_schedule(res, tasks, algo, verbose);
+
+  double T_prime = 0;
+  for (auto &tk : tasks)
+    T_prime += (double)tk.r * tk.t;
+  T_prime /= n;
+  std::cout << std::fixed << std::setprecision(4);
+  std::cout << "\nНижняя граница T' = " << T_prime << "\n";
+  std::cout << "T(S) = " << res.T_S << ",  ε = (T(S) - T') / T' = " << std::setprecision(6) << res.eps << "\n";
 
   return 0;
 }
